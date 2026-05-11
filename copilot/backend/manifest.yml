@@ -1,0 +1,55 @@
+# copilot/backend/manifest.yml
+# AWS Copilot – Backend Service (Node.js / Express)
+# Docs: https://aws.github.io/copilot-cli/docs/manifest/backend-service/
+
+name: backend
+type: Backend Service          # Internal ALB – only reachable from inside the VPC
+
+image:
+  build: backend/Dockerfile
+  target: production
+  port: 5000
+
+cpu:    512
+memory: 1024
+count:  2
+
+exec: true
+
+# ── Auto-scaling ─────────────────────────────────────────────────────────────
+scaling:
+  range: 2-6
+  cpu_percentage: 70
+  memory_percentage: 80
+  requests: 1000
+
+# ── Health Check ─────────────────────────────────────────────────────────────
+healthcheck:
+  command:     ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
+  interval:    30s
+  timeout:     10s
+  retries:     3
+  start_period: 30s
+
+# ── Environment variables (non-secret) ───────────────────────────────────────
+variables:
+  PORT:        5000
+  NODE_ENV:    production
+
+# ── Secrets from AWS Secrets Manager / Parameter Store ───────────────────────
+# Run:  copilot secret init  to create these before deploying
+# MONGODB_URI format for Atlas: mongodb+srv://user:pass@cluster.mongodb.net/quickbite
+# MONGODB_URI format for DocumentDB: mongodb://user:pass@docdb-endpoint:27017/quickbite?tls=true&tlsCAFile=rds-combined-ca-bundle.pem
+secrets:
+  MONGODB_URI:  /quickbite/prod/MONGODB_URI
+  JWT_SECRET:   /quickbite/prod/JWT_SECRET
+  FRONTEND_URL: /quickbite/prod/FRONTEND_URL
+
+# ── Per-environment overrides ─────────────────────────────────────────────────
+environments:
+  prod:
+    count: 2
+  dev:
+    count: 1
+    variables:
+      NODE_ENV: development

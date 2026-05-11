@@ -1,0 +1,50 @@
+# copilot/frontend/manifest.yml
+# AWS Copilot – Frontend Service (React / Nginx)
+# Docs: https://aws.github.io/copilot-cli/docs/manifest/lb-web-service/
+
+name: frontend
+type: Load Balanced Web Service   # Public ALB – internet-facing
+
+image:
+  build: frontend/Dockerfile
+  target: production
+  port: 80
+
+cpu:    256
+memory: 512
+count:  2
+
+exec: true
+
+# ── Public ALB routing ───────────────────────────────────────────────────────
+http:
+  path: '/'
+  healthcheck:
+    path:              /
+    success_codes:     '200,301,302'
+    interval:          30s
+    timeout:           5s
+    healthy_threshold: 2
+
+# ── Auto-scaling ─────────────────────────────────────────────────────────────
+scaling:
+  range: 2-6
+  cpu_percentage: 70
+  requests: 2000
+
+# ── Environment variables ────────────────────────────────────────────────────
+# At build time the React app bakes REACT_APP_* into the JS bundle.
+# Use a .env or pass at docker build time via --build-arg.
+variables:
+  NGINX_PORT: 80
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+secrets:
+  REACT_APP_API_URL: /quickbite/prod/API_URL   # e.g. https://api.quickbite.example.com/api
+
+# ── Per-environment overrides ─────────────────────────────────────────────────
+environments:
+  prod:
+    count: 2
+  dev:
+    count: 1

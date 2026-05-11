@@ -1,0 +1,213 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Jenkinsfile  –  QuickBite  (ECR + ECS via AWS Copilot)
+//
+// Pipeline flow:
+//   1. Developer pushes to GitHub
+//   2. GitHub Webhook fires → Jenkins EC2 receives the trigger
+//   3. Jenkins: pulls code  →  builds Docker images  →  pushes to ECR
+//   4. Jenkins: calls "copilot svc deploy" → ECS pulls new image & replaces tasks
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+  agent any
+
+  // ── Environment ─────────────────────────────────────────────────────────────
+  environment {
+    // AWS region where ECR repos and ECS cluster live
+    AWS_REGION      = 'ap-south-1'                       // change to your region
+
+    // Your 12-digit AWS account ID  (store as a Jenkins secret text credential)
+    AWS_ACCOUNT_ID  = credentials('aws-account-id')
+
+    // ECR repository URIs  (repos must exist before the first run – see README)
+    ECR_BACKEND     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/quickbite-backend"
+    ECR_FRONTEND    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/quickbite-frontend"
+
+    // Short Git commit SHA used as the Docker image tag
+    IMAGE_TAG       = "${GIT_COMMIT[0..7]}"
+
+    // Copilot app & environment names  (must match what you initialised with
+    // "copilot app init" and "copilot env init" – see copilot-commands.md)
+    COPILOT_APP     = 'quickbite'
+    COPILOT_ENV     = 'prod'
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')
+    // Prevent two builds from running at the same time against the same env
+    disableConcurrentBuilds()
+  }
+
+  // ── Stages ──────────────────────────────────────────────────────────────────
+  stages {
+
+    // ── 1. Checkout ───────────────────────────────────────────────────────────
+    stage('Checkout') {
+      steps {
+        checkout scm
+        echo "▶  Building commit: ${IMAGE_TAG}  branch: ${GIT_BRANCH}"
+      }
+    }
+
+    // ── 2. ECR Login ──────────────────────────────────────────────────────────
+    // The Jenkins EC2 instance must have an IAM role (or the Jenkins AWS
+    // credentials plugin) with ecr:GetAuthorizationToken + ecr:BatchCheckLayerAvailability
+    // + ecr:PutImage + ecr:InitiateLayerUpload + ecr:UploadLayerPart + ecr:CompleteLayerUpload
+    stage('Login to ECR') {
+      steps {
+        sh '''
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin \
+                ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          echo "✔  ECR login successful"
+        '''
+      }
+    }
+
+    // ── 3. Build Docker Images (parallel) ────────────────────────────────────
+    stage('Build Docker Images') {
+      parallel {
+
+        stage('Build Backend') {
+          steps {
+            dir('backend') {
+              sh """
+                docker build \
+                  --target production \
+                  -t ${ECR_BACKEND}:${IMAGE_TAG} \
+                  -t ${ECR_BACKEND}:latest \
+                  .
+                echo "✔  Backend image built → ${ECR_BACKEND}:${IMAGE_TAG}"
+              """
+            }
+          }
+        }
+
+        stage('Build Frontend') {
+          steps {
+            dir('frontend') {
+              sh """
+                docker build \
+                  --target production \
+                  -t ${ECR_FRONTEND}:${IMAGE_TAG} \
+                  -t ${ECR_FRONTEND}:latest \
+                  .
+                echo "✔  Frontend image built → ${ECR_FRONTEND}:${IMAGE_TAG}"
+              """
+            }
+          }
+        }
+
+      }
+    }
+
+    // ── 4. Push to ECR ────────────────────────────────────────────────────────
+    stage('Push to ECR') {
+      steps {
+        sh """
+          docker push ${ECR_BACKEND}:${IMAGE_TAG}
+          docker push ${ECR_BACKEND}:latest
+          docker push ${ECR_FRONTEND}:${IMAGE_TAG}
+          docker push ${ECR_FRONTEND}:latest
+          echo "✔  Images pushed to ECR"
+        """
+      }
+    }
+
+    // ── 5. Deploy to ECS via AWS Copilot ─────────────────────────────────────
+    // "copilot svc deploy" tells ECS to create a new task definition that
+    // references the new ECR image, then performs a rolling replacement of
+    // the running tasks.  The --tag flag pins the exact commit SHA.
+    stage('Deploy to ECS') {
+      steps {
+        sh """
+          echo "Deploying backend  → ECS service in env: ${COPILOT_ENV}"
+          copilot svc deploy \
+            --app  ${COPILOT_APP} \
+            --name backend \
+            --env  ${COPILOT_ENV} \
+            --tag  ${IMAGE_TAG}
+
+          echo "Deploying frontend → ECS service in env: ${COPILOT_ENV}"
+          copilot svc deploy \
+            --app  ${COPILOT_APP} \
+            --name frontend \
+            --env  ${COPILOT_ENV} \
+            --tag  ${IMAGE_TAG}
+
+          echo "✔  ECS deployment complete"
+        """
+      }
+    }
+
+    // ── 6. Smoke Test ─────────────────────────────────────────────────────────
+    // Grab the public ALB DNS name that Copilot created for the frontend service
+    // and run a quick HTTP check.
+    stage('Smoke Test') {
+      steps {
+        sh '''
+          FRONTEND_URL=$(copilot svc show \
+                           --app  $COPILOT_APP \
+                           --name frontend \
+                           --env  $COPILOT_ENV \
+                           --json \
+                         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['routes'][0]['url'])")
+
+          echo "Smoke testing: $FRONTEND_URL"
+          curl -f --retry 5 --retry-delay 10 "$FRONTEND_URL" || exit 1
+
+          BACKEND_HEALTH=$(copilot svc show \
+                             --app  $COPILOT_APP \
+                             --name backend \
+                             --env  $COPILOT_ENV \
+                             --json \
+                           | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['routes'][0]['url'])")
+
+          echo "Backend health check: $BACKEND_HEALTH/health"
+          curl -f --retry 5 --retry-delay 10 "$BACKEND_HEALTH/health" || exit 1
+
+          echo "✔  Smoke tests passed"
+        '''
+      }
+    }
+
+  }
+
+  // ── Post Actions ─────────────────────────────────────────────────────────────
+  post {
+
+    success {
+      echo "✅  Deployment ${IMAGE_TAG} to ECS succeeded"
+    }
+
+    failure {
+      echo "❌  Deployment failed — initiating ECS rollback"
+      // Copilot rolls back by redeploying the previous task-definition revision
+      sh """
+        copilot svc deploy \
+          --app  ${COPILOT_APP} \
+          --name backend \
+          --env  ${COPILOT_ENV} \
+          --tag  latest || true
+
+        copilot svc deploy \
+          --app  ${COPILOT_APP} \
+          --name frontend \
+          --env  ${COPILOT_ENV} \
+          --tag  latest || true
+      """
+    }
+
+    always {
+      // Remove local images to keep Jenkins disk healthy
+      sh """
+        docker rmi ${ECR_BACKEND}:${IMAGE_TAG}  || true
+        docker rmi ${ECR_FRONTEND}:${IMAGE_TAG} || true
+        docker rmi ${ECR_BACKEND}:latest        || true
+        docker rmi ${ECR_FRONTEND}:latest       || true
+      """
+    }
+
+  }
+}
